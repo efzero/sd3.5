@@ -153,7 +153,13 @@ class BaseModel(torch.nn.Module):
     def apply_model(self, x, sigma, c_crossattn=None, y=None, skip_layers=[], controlnet_cond=None):
         dtype = self.get_dtype()
         timestep = self.model_sampling.timestep(sigma).float()
+        
         controlnet_hidden_states = None
+        ##############testing dropping controlnet condition###################
+#         if timestep < 500:
+#             controlnet_cond = None
+#         ###########################################################################
+        
         if controlnet_cond is not None:
             y_cond = y.to(dtype)
             controlnet_cond = controlnet_cond.to(dtype=x.dtype, device=x.device)

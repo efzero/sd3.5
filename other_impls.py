@@ -227,7 +227,13 @@ class CLIPTextModel(torch.nn.Module):
         self.text_projection = nn.Linear(
             embed_dim, embed_dim, bias=False, dtype=dtype, device=device
         )
-        self.text_projection.weight.copy_(torch.eye(embed_dim))
+        
+        with torch.no_grad():
+
+            eye = torch.eye(embed_dim, dtype=self.text_projection.weight.dtype, device=self.text_projection.weight.device)
+
+            self.text_projection.weight.copy_(eye)
+#         self.text_projection.weight.copy_(torch.eye(embed_dim))
         self.dtype = dtype
 
     def get_input_embeddings(self):
@@ -584,7 +590,7 @@ class T5XXLTokenizer(SDTokenizer):
             tokenizer=T5TokenizerFast.from_pretrained("google/t5-v1_1-xxl"),
             has_start_token=False,
             pad_to_max_length=False,
-            max_length=99999999,
+            max_length=77,
             min_length=77,
         )
 
