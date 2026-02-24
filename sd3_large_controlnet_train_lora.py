@@ -136,7 +136,7 @@ class ImageCaptionDataset(Dataset):
       - image_root/: image files
       - captions_file: text file of "filename<TAB>caption" per line
     """
-    def __init__(self, image_root: str, captions_file: str, lq_image_root: str, imgperprompt=10):
+    def __init__(self, image_root: str, captions_file: str, lq_image_root: str, imgperprompt=1):
         self.image_root = image_root
         self.items: List[str] = []
         self.lq_image_root = lq_image_root
@@ -906,70 +906,21 @@ def main(**kwargs):
     trainer = Trainer(cfg)
 #     trainer._load("/scratch/liyues_root/liyues/shared_data/bowenbw/sd3.5/outputs/controlnet_lora/controlnet_lora_step500_20260124_235259.pt") ###with ours lora checkpoint
 #     trainer._load("/scratch/liyues_root/liyues/shared_data/bowenbw/sd3.5/outputs/controlnet_lora/controlnet_lora_step600_20260127_010850_large.pt")
-    
 #     trainer._load("/scratch/liyues_root/liyues/shared_data/bowenbw/sd3.5/outputs/controlnet_lora_step1000_20260127_032137_large.pt")
 #     trainer._load("outputs/controlnet_lora/controlnet_lora_final_step2000.pt")
-    
 #     trainer._load("outputs/controlnet_lora/controlnet_lora_step400_20260127_061049_large_promptflip.pt")
-
 #     trainer._load("outputs/controlnet_lora/controlnet_lora_step2000_20260128_053556_large_promptflip.pt")
-    
-    
-    
 #     trainer._load("outputs/controlnet_lora/controlnet_lora_step1400_20260128_002718_large_promptflip.pt")
     
-    trainer._load("outputs/controlnet_lora/controlnet_lora_step2000_20260127_074346_large.pt")
+#     trainer._load("outputs/controlnet_lora/controlnet_lora_step2000_20260127_074346_large.pt")
+    trainer._load("outputs/controlnet_grpo/controlnet_grpo_new_step2400_20260221_181544.pt")
     
     ##############Testing########################
 #     trainer.infer(prompts = ["A brown teddy bear [[314,128,931,858]] sits next to a blue latex glove [[000,295,422,887]]."], controlnet_cond_image = "/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_medium_images/000000_lq.png", init_image = "", out_dir = "recon")
     
 #     trainer.infer(prompts = ["A man [[280,000,633,924]] in a white shirt [[300,071,647,400]] and blue shorts [[334,372,589,593]] is running on a track [[000,800,995,995]]."], controlnet_cond_image = "/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/bowen_im/IMG_6369.jpeg", init_image = "/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/bowen_im/IMG_6369.jpeg", out_dir = "recon_ablation", save_path = f"bowenrunning_cutoff600_denoise0.9.png", denoise = 0.90)
-    
-    
-    
 #     trainer.infer(prompts = ["A couch [[000,170,998,872]] with two pillows [[074,182,506,515;498,166,998,518]] is in the foreground, with a white plate [[345,840,692,998]] on a table [[003,846,998,998]] in the background."], controlnet_cond_image = "/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images/000_lq.png", init_image = "", out_dir = "recon")
-    
-    ################################################
-    
-    for i in range(0, 50):
-#         prompt_file = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images/{str(i).zfill(3)}_lq.txt"
-        prompt_file = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_prompts_test_DIV2K/{str(i).zfill(5)}.txt"###DIV2K
-#         prompt_file = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_prompts_test_CelebA/{str(i).zfill(5)}.txt" ###CelebA 
-#         prompt_file = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/test_VideoLQ_prompts/{str(i).zfill(5)}.txt" ###VideoLQ
-#         prompt_file = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/lumi_test/prompts/{str(i).zfill(5)}.txt"
-        with open(prompt_file, "r", encoding="utf-8") as f:
-            prompt = f.readlines()[0].strip()
-
-        if not prompt:
-            raise ValueError(f"Empty prompt in {prompt_file}")
-        PROMPT = "a high-resolution and sharp image, Cinematic, hyper sharpness, highly detailed, perfect without deformations, hyper detailed photo - realistic maximum detail"    
-            
-            
-        ###########ControlNet#################
-        lq_path = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/test_DIV2K/{str(i).zfill(5)}.png" ###DIV2K
-        
-#         lq_path = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images_test_CelebA/{str(i).zfill(5)}.png"  ###CelebA
-#         lq_path = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/test_VideoLQ/{str(i).zfill(5)}.png"
-#         lq_path = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/lumi_test/lq/{str(i).zfill(5)}.png"
-        ###########Ours###################
-        
-        for seed in range(20):
-            trainer.infer(
-                prompts=[f"{prompt}, {DEFAULT_PROMPT}"],
-    #             prompts = [prompt],
-    #             prompts = [DEFAULT_PROMPT],
-    #             controlnet_cond_image=f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images_test_severe/{str(i).zfill(3)}.png",
-    #             init_image=f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images_test_severe/{str(i).zfill(3)}.png",
-                controlnet_cond_image = lq_path,
-                init_image = lq_path,
-                denoise=0.98,
-    #             out_dir = "recon_ours_videolq_hq",
-                out_dir="recon_ours_div2k_ablation",
-    #             out_dir="recon_large_lumi",
-                save_path = f"recon_{str(i).zfill(5)}_seed{seed}.png"
-            )
-        
-        ############Ours#####################
+            ############Ours#####################
 
 #         trainer.infer(
 #             prompts=[prompt],
@@ -985,17 +936,35 @@ def main(**kwargs):
 # #         lq_path = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/lumi_test/lq/{str(i).zfill(5)}.png"
         
 #         ###########Ours###################
-#         trainer.infer(
-#             prompts=[f"{prompt}, {DEFAULT_PROMPT}"],
-# #             controlnet_cond_image=f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images_test_severe/{str(i).zfill(3)}.png",
-# #             init_image=f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images_test_severe/{str(i).zfill(3)}.png",
-#             controlnet_cond_image = lq_path,
-#             init_image = lq_path,
-#             denoise=1.0,
-#             out_dir="recon_large_div2k",
-# #             out_dir="recon_large_lumi",
-#             save_path = f"recon_{str(i).zfill(5)}.png"
-#         )
+    for i in range(0, 10):
+# #         prompt_file = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images/{str(i).zfill(3)}_lq.txt"
+#         prompt_file = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_prompts_test_DIV2K/{str(i).zfill(5)}.txt"###DIV2K
+    
+#         lq_path = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/test_DIV2K/{str(i).zfill(5)}.png" ###DIV2K
+        
+        lq_path = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images_test_CelebA/{str(i).zfill(5)}.png"  ###CelebA
+# #         lq_path = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/test_VideoLQ/{str(i).zfill(5)}.png"
+# #         lq_path = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/lumi_test/lq/{str(i).zfill(5)}.png"
+        prompt_file = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_prompts_test_CelebA/{str(i).zfill(5)}.txt" ###CelebA 
+# #         prompt_file = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/test_VideoLQ_prompts/{str(i).zfill(5)}.txt" ###VideoLQ
+# #         prompt_file = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/lumi_test/prompts/{str(i).zfill(5)}.txt"
+        with open(prompt_file, "r", encoding="utf-8") as f:
+            prompt = f.readlines()[0].strip()
+
+#         if not prompt:
+#             raise ValueError(f"Empty prompt in {prompt_file}")
+#         PROMPT = "a high-resolution and sharp image, Cinematic, hyper sharpness, highly detailed, perfect without deformations, hyper detailed photo - realistic maximum detail"    
+        trainer.infer(
+            prompts=[f"{prompt}, {DEFAULT_PROMPT}"],
+#             controlnet_cond_image=f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images_test_severe/{str(i).zfill(3)}.png",
+#             init_image=f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images_test_severe/{str(i).zfill(3)}.png",
+            controlnet_cond_image = lq_path,
+            init_image = lq_path,
+            denoise=1.0,
+            out_dir="recon_large_celeba_grpo_cutoff300_true",
+#             out_dir="recon_large_lumi",
+            save_path = f"recon_{str(i).zfill(5)}.png"
+        )
         
         
 #         trainer.infer(
@@ -1048,17 +1017,48 @@ def main(**kwargs):
 #             save_path = f"recon_{str(i).zfill(3)}.png"
 #         )
         ####################################
+    
+    ###################ablations#############################
+    
+#     for i in range(0, 50):
+# #         prompt_file = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images/{str(i).zfill(3)}_lq.txt"
+#         prompt_file = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_prompts_test_DIV2K/{str(i).zfill(5)}.txt"###DIV2K
+# #         prompt_file = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_prompts_test_CelebA/{str(i).zfill(5)}.txt" ###CelebA 
+# #         prompt_file = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/test_VideoLQ_prompts/{str(i).zfill(5)}.txt" ###VideoLQ
+# #         prompt_file = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/lumi_test/prompts/{str(i).zfill(5)}.txt"
+#         with open(prompt_file, "r", encoding="utf-8") as f:
+#             prompt = f.readlines()[0].strip()
+
+#         if not prompt:
+#             raise ValueError(f"Empty prompt in {prompt_file}")
+#         PROMPT = "a high-resolution and sharp image, Cinematic, hyper sharpness, highly detailed, perfect without deformations, hyper detailed photo - realistic maximum detail"    
             
+            
+#         ###########ControlNet#################
+#         lq_path = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/test_DIV2K/{str(i).zfill(5)}.png" ###DIV2K
         
+# #         lq_path = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images_test_CelebA/{str(i).zfill(5)}.png"  ###CelebA
+# #         lq_path = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/test_VideoLQ/{str(i).zfill(5)}.png"
+# #         lq_path = f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/lumi_test/lq/{str(i).zfill(5)}.png"
+#         ###########Ours###################
         
+#         for seed in range(20):
+#             trainer.infer(
+#                 prompts=[f"{prompt}, {DEFAULT_PROMPT}"],
+#     #             prompts = [prompt],
+#     #             prompts = [DEFAULT_PROMPT],
+#     #             controlnet_cond_image=f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images_test_severe/{str(i).zfill(3)}.png",
+#     #             init_image=f"/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images_test_severe/{str(i).zfill(3)}.png",
+#                 controlnet_cond_image = lq_path,
+#                 init_image = lq_path,
+#                 denoise=0.98,
+#     #             out_dir = "recon_ours_videolq_hq",
+#                 out_dir="recon_ours_div2k_ablation",
+#     #             out_dir="recon_large_lumi",
+#                 save_path = f"recon_{str(i).zfill(5)}_seed{seed}.png"
+#             )
         
-        
-        
-        
-    
-#     for si in range(20, 30):
-    
-#         trainer.infer(prompts = ["A television [[163,154,838,717]] is turned on and showing a horse [[232,225,598,598]] on the screen [[228,200,769,592]]."], controlnet_cond_image = "/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images/001_lq.png", init_image = "/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images/001_lq.png", denoise = 1.0, seed = si, out_dir = "recon_all", save_path = f"recon_1_seed{str(si)}_cutoff300_denoise1.0.png")
+    #################training###############
     
 #     trainer.train()
 
