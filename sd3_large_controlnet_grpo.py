@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from safetensors import safe_open
+import pyiqa
 
 import sd3_impls
 from other_impls import SD3Tokenizer, SDClipModel, SDXLClipG, T5XXLModel
@@ -54,6 +55,14 @@ _lpips_model = None
 def init_lpips(device="cuda", net="alex"):
     global _lpips_model
     _lpips_model = lpips.LPIPS(net=net).to(device).eval()
+    
+def get_lora_grad_norm(model):
+    total_norm = 0.0
+    for name, p in model.named_parameters():
+        if "lora" in name and p.grad is not None:
+            total_norm += p.grad.data.norm(2).item() ** 2
+    return total_norm ** 0.5
+
     
     
 ################################################################################
@@ -388,6 +397,103 @@ def reward_model_lpips_l1_batch(
 ################################################################################
 
 
+import numpy as np
+import torch
+import pyiqa
+
+_lpips_model = None
+_musiq_model = None
+
+def init_reward_models(device="cuda"):
+    global _lpips_model, _musiq_model
+    if _lpips_model is None:
+        init_lpips(device=device, net="vgg")  # your existing init
+    if _musiq_model is None:
+        _musiq_model = pyiqa.create_metric("musiq", device=device)
+
+@torch.no_grad() #####0.32 0.34 0.33,0.39 
+def reward_model_lpips_musiq_batch(
+    gen_images,
+    gt_images,
+    device="cuda",
+    group_size: int = 6,            # e.g., K for GRPO
+    lpips_tie_thresh: float = 0.03,
+    musiq_scale: float = 300.0,    
+):
+    """
+    Reward = -LPIPS + gated MUSIQ bonus.
+
+    If group_size is provided, use group-relative tie-break:
+      add MUSIQ bonus only when LPIPS is within lpips_tie_thresh of group-best LPIPS.
+
+    Returns:
+      rewards: (N,) cpu tensor
+      aux: dict of cpu tensors for logging (lpips, musiq, bonus)
+    """
+    global _lpips_model, _musiq_model
+    init_reward_models(device=device)
+
+    def stack_pil(imgs):
+        arr = np.stack(
+            [np.array(im.convert("RGB")).astype(np.float32) / 255.0 for im in imgs],
+            axis=0
+        )  # (N,H,W,3)
+        t = torch.from_numpy(arr).permute(0, 3, 1, 2)  # (N,3,H,W)
+        t = t * 2.0 - 1.0  # for LPIPS
+        return t
+
+    # LPIPS input in [-1,1]
+    gen_lp = stack_pil(gen_images).to(device)
+    gt_lp  = stack_pil(gt_images).to(device)
+
+    # MUSIQ commonly expects [0,1] RGB (check your pyiqa version)
+    gen_mq = (gen_lp + 1.0) / 2.0
+    gen_mq = gen_mq.clamp(0, 1)
+
+    # LPIPS
+    lpips_d = _lpips_model(gen_lp, gt_lp)               # (N,1,1,1) or (N,1)
+    lpips_d = lpips_d.view(lpips_d.shape[0], -1).mean(1)  # (N,)
+    base_reward = -lpips_d
+    
+    
+
+    # MUSIQ (higher is better)
+    musiq_score = _musiq_model(gen_mq).view(-1)  # shape (N,) in many pyiqa setups
+
+    # Gating
+    N = lpips_d.shape[0]
+    bonus = torch.zeros_like(base_reward)
+
+    if group_size is None:
+        # fallback: absolute LPIPS gate (less recommended)
+        gate = (lpips_d < lpips_tie_thresh).float()
+        bonus = gate * (musiq_score / musiq_scale)
+    else:
+        assert N % group_size == 0, f"N={N} must be divisible by group_size={group_size}"
+        G = N // group_size
+        lp = lpips_d.view(G, group_size)
+        mq = musiq_score.view(G, group_size)
+        
+
+        lp_best = lp.min(dim=1, keepdim=True).values
+        mq_worst = mq.min(dim=1, keepdim=True).values
+        mq_adv = mq - mq_worst
+        gate = ((lp - lp_best) < lpips_tie_thresh).float()
+
+        bonus = (gate * (mq_adv / musiq_scale)).view(-1)
+
+    rewards = base_reward + bonus
+
+#     aux = {
+#         "lpips": lpips_d.detach().cpu(),
+#         "musiq": musiq_score.detach().cpu(),
+#         "bonus": bonus.detach().cpu(),
+#         "base_reward": base_reward.detach().cpu(),
+#     }
+
+    return rewards.detach().cpu(), musiq_score.detach().cpu(), lpips_d.detach().cpu()
+
+
 
 
 
@@ -705,8 +811,8 @@ class GRPOConfig(TrainConfig):
     timestep_fraction: float = 0.50 # Fraction of timesteps to train on  (timestep_fraction=0.99)
     kl_beta: float = 0.00           # KL regularization weight  (beta=0.02)
     wandb_project: str = "sd3-grpo-controlnet"
-    wandb_run_name: str = "grpo-run-l1lpips-seed6-ccs-2.5"
-    save_suffix: str = f"grpo-run-l1lpips-seed6-ccs-2.5"
+    wandb_run_name: str = "grpo-run-lpipsmusiq-seed6-ccs-2.5-cutoff750-step300.25"
+    save_suffix: str = f"grpo-run-lpipsmusiq-seed6-ccs-2.5-cutoff750-step300.25"
 
 
 ################################################################################
@@ -1167,24 +1273,49 @@ class GRPOTrainer:
 
             # ==================== REWARD COMPUTATION ====================
             rewards = torch.zeros(K, B)   # (K, B) for l2 reward
+            reward_musiqs = torch.zeros(K, B)
+#             reward_lpips = torch.zeros(K, B)
             ########################for L2 reward##################################
 #             for k in range(K):
 #                 for b in range(B):
 #                     rewards[k, b] = reward_model(all_gen_images[k][b], gt_images[b])
-                    
             #######################################################################
-        
+
             ###########################different rewards##########################
-            for k in range(K):
+#             for k in range(K):
 # #                 rewards[k] = reward_model_lpips_batch(all_gen_images[k], gt_images) ###pure Alex lpips
-                rewards[k] = reward_model_lpips_l1_batch(all_gen_images[k], gt_images) ####VGG lpips and L1
-                    
-                              
+#                 rewards[k] = reward_model_lpips_l1_batch(all_gen_images[k], gt_images) ####VGG lpips and L1
+#                 rewards[k], reward_musiqs[k] = reward_model_lpips_musiq_batch(all_gen_images[k], gt_images) ###rewards
+
+            #######################grouped rewards###################################
+            flat_gen = []
+            flat_gt = []
+            # Flatten in (B, K) order so each contiguous block of K is one GRPO group
+            for b in range(B):
+                for k in range(K):
+                    flat_gen.append(all_gen_images[k][b])  # candidate k for image b
+                    flat_gt.append(gt_images[b])           # same GT repeated K times
+
+            # Compute reward once, with correct group_size=K
+            flat_rewards, flat_musiqs, flat_lpips = reward_model_lpips_musiq_batch(
+                flat_gen,
+                flat_gt,
+                device=self.device,
+                group_size=K,   # IMPORTANT: group over K candidates of the same image
+            )
+
+            # Reshape back: flat was (B, K), so view(B, K) then transpose -> (K, B)
+            rewards = flat_rewards.view(B, K).transpose(0, 1).contiguous()         # (K, B)
+            reward_musiqs = flat_musiqs.view(B, K).transpose(0, 1).contiguous()    # (K, B)
+            reward_lpips = flat_lpips.view(B, K).transpose(0, 1).contiguous()
+                  
 
             # ==================== ADVANTAGE COMPUTATION =================
             # Normalize within K group per base image
             adv_mean = rewards.mean(dim=0, keepdim=True)              # (1, B)
-            adv_std  = rewards.std(dim=0, unbiased=False, keepdim=True).clamp(min=1e-4)  # (1, B)
+            adv_std  = rewards.std(dim=0, unbiased=False, keepdim=True).clamp(min=1e-3)  # (1, B)
+
+#             adv_std = 1e-2 ###prevent noisy gradient
             
             print(adv_mean, "Adv mean", adv_std, "adv std")
             advantages = (rewards - adv_mean) / adv_std               # (K, B)
@@ -1193,6 +1324,8 @@ class GRPOTrainer:
                 "reward/mean":   rewards.mean().item(),
                 "reward/std":    rewards.std().item(),
                 "adv/abs_mean":  advantages.abs().mean().item(),
+                "musiq/mean": reward_musiqs.mean().item(),
+                "lpips/mean": reward_lpips.mean().item(),
             }, step=self.global_step)
 
             # Skip update if all rewards are identical (no learning signal)
@@ -1257,15 +1390,12 @@ class GRPOTrainer:
                             ratio, 1.0 - cfg.clip_range, 1.0 + cfg.clip_range
                         )
                         
-                        print(unclipped.item(), "unclipped", clipped.item(), "clipped")
                         ppo_loss = torch.mean(torch.maximum(unclipped, clipped))
-                        print(ppo_loss, "ppo loss")
 
                         # KL regularization: penalizes drift from the reference model
                         # KL ≈ ||mean_new - mean_ref||² / (2 * std²)  (Gaussian KL, same std)
 #                         cfg.kl_beta = 0 ###just for testing
                         if cfg.kl_beta > 0:
-                            print("using KL loss")
                             kl_loss = (
                                 (mean_new - mean_ref).pow(2)
                                 .mean(dim=(1, 2, 3), keepdim=True)
@@ -1274,21 +1404,23 @@ class GRPOTrainer:
                             kl_loss = torch.mean(kl_loss)
                             loss = (ppo_loss + cfg.kl_beta * kl_loss) / total_updates
                         else:
-                            print("skip kl loss")
                             kl_loss = None
                             loss = ppo_loss / total_updates
-
-                        print(log_prob_new, "logprobnew", old_log_prob, "oldlogprob")
-                        print(ratio.item(), "logprob ratio", "inner epoch", inner_epoch)
-#                         print(adv_k.item(), "advantage k", "inner epoch", inner_epoch)
                         delta = (log_prob_new - old_log_prob).detach()
-                        print(delta.item(), "delta_logp", torch.exp(delta).item(), "ratio", "inner epoch", inner_epoch)
                         if self.scaler.is_enabled():
                             self.scaler.scale(loss).backward()
                         else:
                             loss.backward()
-                        total_ppo_loss += ppo_loss.item()
+                            
+                
+                
+                total_ppo_loss += ppo_loss.item()
 
+                grad_norm = get_lora_grad_norm(self.sd3.model.control_model)
+                wandb.log({
+                    "train/lora_grad_norm": grad_norm
+                }, step=self.global_step)
+                
                 # Gradient clipping and optimizer step
                 if cfg.grad_clip > 0:
                     
@@ -1344,8 +1476,8 @@ class GRPOTrainer:
                 log_dict["images/gt_best_worst"] = wandb.Image(
                     strip,
                     caption=(
-                        f"GT | best(k={best_k}, r={rewards[best_k, b_idx]:.3f}) | "
-                        f"worst(k={worst_k}, r={rewards[worst_k, b_idx]:.3f})"
+                        f"GT | best(k={best_k}, r={reward_lpips[best_k, b_idx]:.3f}) m={reward_musiqs[best_k, b_idx]:.3f} |"
+                        f"worst(k={worst_k}, r={reward_lpips[worst_k, b_idx]:.3f} m={reward_musiqs[worst_k, b_idx]:.3f})"
                     ),
                 )
 

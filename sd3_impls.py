@@ -55,6 +55,9 @@ class ModelSamplingDiscreteFlow(torch.nn.Module):
         return sigma * noise + (1.0 - sigma) * latent_image
 
 
+    
+    
+    
 class BaseModel(torch.nn.Module):
     """Wrapper around the core MM-DiT model"""
 
@@ -150,20 +153,30 @@ class BaseModel(torch.nn.Module):
                 dtype=dtype,
             )
 
-    def apply_model(self, x, sigma, c_crossattn=None, y=None, skip_layers=[], controlnet_cond=None):
+    def apply_model(self, x, sigma, c_crossattn=None, y=None, skip_layers=[], controlnet_cond=None, cutoff = 0):
         dtype = self.get_dtype()
         timestep = self.model_sampling.timestep(sigma).float()
         
         controlnet_hidden_states = None
         ##############testing dropping controlnet condition###################
-#         if timestep < 500:
-#             controlnet_cond = None
-#         ###########################################################################
+        
+
+#         cutoff = 300
+#         cutoff = 500
+#         cutoff = 300
+#         cutoff = 950
+        cutoff = 0
+#         cutoff = 750
+        if timestep[0] < cutoff:
+            print(timestep, "cut off sampling at timestep")
+            controlnet_cond = None
+        ###########################################################################
+        # python sd3_infer.py --model models/sd3.5_large.safetensors --controlnet_ckpt models/sd3.5_large_controlnet_blur.safetensors --controlnet_cond_image inputs/blur.png --prompt "generated ai art, a tiny, lost rubber ducky in an action shot close-up, surfing the humongous waves, inside the tube, in the style of Kelly Slater"
         
         if controlnet_cond is not None:
             y_cond = y.to(dtype)
             controlnet_cond = controlnet_cond.to(dtype=x.dtype, device=x.device)
-            controlnet_cond = controlnet_cond.repeat(x.shape[0], 1, 1, 1)
+#             controlnet_cond = controlnet_cond.repeat(x.shape[0], 1, 1, 1) ####why do we need to repeat here?
 
             if not self.control_model.using_8b_controlnet:
                 y_cond = self.diffusion_model.y_embedder(y)
@@ -172,6 +185,10 @@ class BaseModel(torch.nn.Module):
             if self.control_model.using_8b_controlnet:
                 hw = x.shape[-2:]
                 x_controlnet = self.diffusion_model.x_embedder(x) + self.diffusion_model.cropped_pos_embed(hw)
+                
+                
+                
+#             print(x_controlnet.shape, controlnet_cond.shape,"xcondtrolnet", "controlnetcond")
             controlnet_hidden_states = self.control_model(
                 x_controlnet, controlnet_cond, y_cond, 1, sigma.to(torch.float32)
             )
@@ -352,6 +369,117 @@ def sample_euler(model, x, sigmas, extra_args=None):
         # Euler method
         x = x + d * dt
     return x
+
+
+@torch.no_grad()
+def invert_kdiff_midpoint(
+    model,
+    x,
+    sigmas,
+    extra_args=None,
+    callback=None,
+    autocast_dtype=torch.float16,
+):
+    """
+    Invert a k-diffusion-style denoiser from low noise (typically sigma=0) to high noise
+    using a midpoint (RK2) integrator, analogous to denoise_fireflow's algorithm.
+
+    Args:
+        model:
+            Denoiser model with signature:
+                denoised = model(x, sigma_batch, **extra_args)
+        x: torch.Tensor
+            Starting latent, usually x0 / near-clean latent at sigma = sigmas[-1] (often 0).
+        sigmas: 1D torch.Tensor or list
+            SAME sigma schedule as your forward sampler, typically descending order:
+                [sigma_max, ..., 0]
+            This function will walk it in reverse (0 -> sigma_max).
+        extra_args: dict | None
+            Extra kwargs passed into model.
+        callback: callable | None
+            Optional callback per step. Called with a dict of debug values.
+        autocast_dtype: torch.dtype | None
+            If not None and x is CUDA, run model calls under torch.autocast("cuda", dtype=...)
+            Set to None to disable autocast.
+
+    Returns:
+        x: torch.Tensor
+            Inverted latent at high sigma (approximately the noise latent corresponding
+            to the provided clean/low-noise input under this solver + model).
+    """
+    extra_args = {} if extra_args is None else extra_args
+
+    if not torch.is_tensor(sigmas):
+        sigmas = torch.tensor(sigmas, device=x.device, dtype=x.dtype)
+    else:
+        sigmas = sigmas.to(device=x.device, dtype=x.dtype)
+
+    # Batch sigma helper
+    s_in = x.new_ones([x.shape[0]])
+
+    def eval_d(x_in, sigma_scalar):
+        """
+        Evaluate ODE derivative d = to_d(x, sigma, denoised) at (x_in, sigma_scalar).
+
+        Assumes you already have `to_d` defined exactly as in your k-diffusion sampler path.
+        """
+        sigma_batch = sigma_scalar * s_in
+
+        if x_in.is_cuda and autocast_dtype is not None:
+            with torch.autocast("cuda", dtype=autocast_dtype):
+                denoised = model(x_in, sigma_batch, **extra_args)
+        else:
+            denoised = model(x_in, sigma_batch, **extra_args)
+
+        # IMPORTANT: must match your forward sampler's to_d/sign convention
+        d = to_d(x_in, sigma_scalar, denoised)
+        return d, denoised
+
+    # We assume sigmas is descending [sigma_max, ..., 0]
+    # Inversion walks from the end toward the beginning:
+    #   current sigma = sigmas[i], next sigma = sigmas[i-1]
+    # so h = sigma_next - sigma_cur is typically positive.
+    n = len(sigmas)
+    if n < 2:
+        return x
+
+    for i in range(n - 1, 0, -1):
+        sigma_cur = sigmas[i]
+        sigma_next = sigmas[i - 1]
+        h = sigma_next - sigma_cur  # positive for descending schedule during inversion
+
+        # Midpoint RK2:
+        # k1 = f(x, sigma_cur)
+        d1, denoised_1 = eval_d(x, sigma_cur)
+
+        # x_mid = x + (h/2) * k1
+        x_mid = x + 0.5 * h * d1
+
+        # sigma_mid = sigma_cur + h/2
+        sigma_mid = sigma_cur + 0.5 * h
+
+        # k_mid = f(x_mid, sigma_mid)
+        d_mid, denoised_mid = eval_d(x_mid, sigma_mid)
+
+        # x_next = x + h * k_mid
+        x = x + h * d_mid
+
+        if callback is not None:
+            callback({
+                "i": i,
+                "sigma_cur": float(sigma_cur.detach().item()),
+                "sigma_next": float(sigma_next.detach().item()),
+                "sigma_mid": float(sigma_mid.detach().item()),
+                "h": float(h.detach().item()),
+                "x": x,
+                "x_mid": x_mid,
+                "d1_norm": float(d1.float().norm().detach().item()),
+                "d_mid_norm": float(d_mid.float().norm().detach().item()),
+                "denoised_1": denoised_1,
+                "denoised_mid": denoised_mid,
+            })
+    return x
+
 
 
 @torch.no_grad()
