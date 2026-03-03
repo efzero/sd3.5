@@ -32,6 +32,8 @@
 # python sd3_large_controlnet_infer.py --model=models/sd3.5_large.safetensors --controlnet_ckpt=models/sd3.5_large_controlnet_blur.safetensors --lora_checkpoint=outputs/controlnet_grpo-run-lpipsmusiq-seed6-ccs-2.5-cutoff750_step2500_20260226_015338.pt --lq_dir=/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images_test_DIV2K --prompt_dir=/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_prompts_test_DIV2K/ --out_dir=grpo_lpipsmusiq_iter500_groupsize6_lr5e5_cutoff0_true_div2k --n_images=10
 
 
+# python sd3_large_controlnet_infer.py --model=models/sd3.5_large.safetensors --controlnet_ckpt=models/sd3.5_large_controlnet_blur.safetensors --lora_checkpoint=outputs/controlnet_grpo/controlnet_grpo-run-lpipsmusiq-seed6-ccs-2.5-cutoff750_step2500_20260226_015338.pt --lq_dir=/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images_test_CelebA --prompt_dir=/scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_prompts_test_CelebA/ --out_dir=grpo_lpipsmusiq_iter500_groupsize6_lr5e5_cutoff0_true_celeba --n_images=10
+
 import os
 import math
 from dataclasses import dataclass
@@ -46,9 +48,10 @@ from safetensors import safe_open
 
 import sd3_impls
 from other_impls import SD3Tokenizer, SDClipModel, SDXLClipG, T5XXLModel
-from sd3_impls import SDVAE, BaseModel, SD3LatentFormat
-
+from sd3_impls import SDVAE, BaseModel, SD3LatentFormat, invert_euler, CFGDenoiser, SkipLayerCFGDenoiser
 from tqdm import tqdm
+WIDTH = 1024
+HEIGHT = 1024
 
 DEFAULT_PROMPT = (
     "a high-resolution and sharp image, Cinematic, hyper sharpness, highly detailed, "
@@ -354,7 +357,7 @@ class Inferencer:
 
     @torch.no_grad()
     def _image_to_latent(self, image_path: str, width: int, height: int,
-                         using_2b: bool, control_type: int) -> torch.Tensor:
+                         using_2b: bool = False, control_type: int = 0) -> torch.Tensor:
         im = Image.open(image_path).convert("RGB").resize((width, height), Image.LANCZOS)
         arr = np.array(im).astype(np.float32) / 255.0
         t = torch.from_numpy(np.moveaxis(arr, 2, 0)).unsqueeze(0).to(self.device, dtype=torch.float32)
@@ -392,6 +395,7 @@ class Inferencer:
         sampler: str = "euler",
         controlnet_cond: Optional[torch.Tensor] = None,
         denoise: float = 1.0,
+        init_noise = None,
     ) -> torch.Tensor:
         latent = latent.half().to(self.device)
         self.sd3.model = self.sd3.model.to(self.device)
@@ -413,6 +417,9 @@ class Inferencer:
         noise_scaled = self.sd3.model.model_sampling.noise_scaling(
             sigmas[0], noise, latent, self._max_denoise(sigmas)
         )
+        
+        if init_noise is not None:
+            noise_scaled = init_noise
 
         sample_fn = getattr(sd3_impls, f"sample_{sampler}")
         latent = sample_fn(
@@ -423,6 +430,173 @@ class Inferencer:
         )
         return self.latent_fmt.process_out(latent)
 
+    
+    @torch.no_grad()
+    def do_inversion(
+        self,
+        image,
+        conditioning,
+        neg_cond,
+        steps,
+        cfg_scale,
+        controlnet_cond=None,
+        width=WIDTH,
+        height=HEIGHT,
+    ) -> torch.Tensor:
+        """
+        Invert an image to the initial noise that would produce it under the Euler sampler.
+
+        Uses `invert_kdiff_midpoint` (midpoint/RK2 ODE inverter) which walks the sigma
+        schedule in reverse: sigma≈0 (clean) → sigma_max (noise).
+
+        Args:
+            image: PIL Image or file path (str) of the input image.
+            conditioning: (c, y) tuple from get_cond(), same prompt as sampling.
+            neg_cond: (c, y) tuple from get_cond("").
+            steps: number of inversion steps (should match forward sampling steps).
+            cfg_scale: CFG guidance scale (same as sampling for best round-trip).
+            controlnet_cond: optional control latent tensor (already VAE-encoded + process_in).
+            width, height: target spatial resolution.
+
+        Returns:
+            noise_latent: torch.Tensor — inverted latent at sigma_max, same shape as
+                          the noisy latent fed into sample_euler during forward sampling.
+        """
+        # --- 1. Encode input image to clean internal latent (process_in format) ---
+        if isinstance(image, str):
+            # file path: _image_to_latent encodes + process_in
+            latent = self._image_to_latent(image, width, height)
+        else:
+            # PIL Image
+            raw_lat = self.vae_encode(image)                   # raw VAE latent, CPU
+            latent = SD3LatentFormat().process_in(raw_lat)     # scale to internal format
+
+        latent = latent.half().cuda()
+        self.sd3.model = self.sd3.model.cuda()
+
+        # --- 2. Build the same descending sigma schedule as do_sampling ---
+        sigmas = self._get_sigmas(steps).cuda()
+        # sigmas: [sigma_max, ..., sigma_min, 0]
+        # invert_kdiff_midpoint will walk this backward (index n-1 → 0),
+        # i.e., starting from the clean latent at sigmas[-1]≈0 → noise at sigmas[0]=sigma_max
+
+        # --- 3. Build conditioning (same structure as do_sampling extra_args) ---
+        conditioning = self._fix_cond(conditioning)
+        neg_cond = self._fix_cond(neg_cond)
+        extra_args = {
+            "cond": conditioning,
+            "uncond": neg_cond,
+            "cond_scale": cfg_scale,
+            "controlnet_cond": controlnet_cond,
+        }
+
+        # --- 4. Run midpoint ODE inversion ---
+#         noise_latent = sd3_impls.invert_kdiff_midpoint(
+#             CFGDenoiser(self.sd3.model),
+#             latent,       # clean latent at sigma≈0
+#             sigmas,       # descending schedule; inverter walks it in reverse
+#             extra_args=extra_args,
+#         )
+        
+        noise_latent = sd3_impls.invert_euler(
+            CFGDenoiser(self.sd3.model),
+            latent,       # clean latent at sigma≈0
+            sigmas,       # descending schedule; inverter walks it in reverse
+            extra_args=extra_args,
+        )
+        return noise_latent
+    
+    @torch.no_grad()
+    def reconstruct(
+        self,
+        image,
+        prompt,
+        steps,
+        cfg_scale,
+        controlnet_cond_image=None,
+        width=WIDTH,
+        height=HEIGHT,
+        sampler="euler",
+        save_path="reconstructed.png",
+    ) -> Image.Image:
+        """
+        Invert an image to noise, then re-sample from that noise to reconstruct it.
+
+        A perfect inverter + sampler pair should produce an image nearly identical
+        to the input. Useful for verifying inversion quality or as a starting point
+        for editing.
+
+        Args:
+            image: file path (str) or PIL Image of the input.
+            prompt: text prompt used for both inversion and re-sampling.
+            steps: number of steps (must be the same for both passes).
+            cfg_scale: CFG guidance scale.
+            controlnet_cond_image: optional file path for the ControlNet condition image.
+            width, height: spatial resolution.
+            sampler: sampler name (default "euler", must match what invert_kdiff_midpoint inverts).
+            save_path: where to save the reconstructed image.
+
+        Returns:
+            Reconstructed PIL Image.
+        """
+        # 1. Encode prompt + negative
+        
+        print("reconstructing")
+        conditioning = self.get_cond(prompt)
+        neg_cond = self.get_cond("")
+
+        # 2. Prepare ControlNet latent (if any)
+        controlnet_cond = None
+        if controlnet_cond_image:
+            using_2b, control_type = False, 0
+            if self.sd3.model.control_model is not None:
+                using_2b = not self.sd3.using_8b_controlnet
+                control_type = int(self.sd3.model.control_model.control_type.item())
+            controlnet_cond = self._image_to_latent(
+                controlnet_cond_image, width, height, using_2b, control_type
+            )
+
+        # 3. Invert: image → noise at sigma_max
+        noise_latent = self.do_inversion(
+            image, conditioning, neg_cond, steps, 1.5,
+            controlnet_cond=controlnet_cond, width=width, height=height,
+        )
+        
+        print(noise_latent.mean(), noise_latent.max(), noise_latent.std(), "noise latent mean max std")
+        # noise_latent is already at sigma_max (fully-noised starting point).
+        # Do NOT apply noise_scaling again — that would double-noise it.
+
+        # 4. Re-sample: noise → clean latent
+        self.sd3.model = self.sd3.model.cuda()
+        sigmas = self.get_sigmas(self.sd3.model.model_sampling, steps).cuda()
+
+        extra_args = {
+            "cond": self.fix_cond(conditioning),
+            "uncond": self.fix_cond(neg_cond),
+            "cond_scale": cfg_scale,
+            "controlnet_cond": controlnet_cond,
+        }
+
+        sample_fn = getattr(sd3_impls, f"sample_{sampler}")
+        recon_latent = sample_fn(
+            CFGDenoiser(self.sd3.model),
+            noise_latent,   # already scaled to sigma_max by inversion
+            sigmas,
+            extra_args=extra_args,
+        )
+        recon_latent = SD3LatentFormat().process_out(recon_latent)
+
+        # 5. Decode and save
+        out_image = self.vae_decode(recon_latent)
+        out_dir = os.path.dirname(save_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        out_image.save(save_path)
+        print(f"Saved → {save_path}")
+        
+        return out_image
+    
+    
     @torch.no_grad()
     def infer(
         self,
@@ -466,9 +640,13 @@ class Inferencer:
             )
 
         neg_cond = self.encode_prompt("")
+        import math
 
         for i, prompt in tqdm(list(enumerate(prompts)), total=len(prompts)):
             conditioning = self.encode_prompt(prompt)
+#             init_noise = self.do_inversion(init_image, conditioning, neg_cond, 40, 1.0)
+#             init_noise = (math.sin(1.0) * torch.randn_like(init_noise) + math.cos(1.0) * init_noise).to(init_noise.device).to(init_noise.dtype)
+#             print(init_noise.mean(), init_noise.std())
             sampled_latent = self._do_sampling(
                 latent=latent,
                 seed=seed,
@@ -479,6 +657,7 @@ class Inferencer:
                 sampler=sampler,
                 controlnet_cond=control_lat,
                 denoise=denoise if init_image else 1.0,
+#                 init_noise=init_noise
             )
             img = self._vae_decode(sampled_latent)
             fname = save_path if save_path else f"{i:06d}.png"
@@ -528,6 +707,8 @@ def main(
 
     lq_paths = sorted(glob(f"{lq_dir}/*.png"))
     prompt_paths = sorted(glob(f"{prompt_dir}/*.txt"))
+    
+    supir_paths = sorted(glob("/scratch/liyues_root/liyues/shared_data/xuyuexy/SUPIR/results/lq_images_test_DIV2K/*.png"))
 
     if n_images is not None:
         lq_paths = lq_paths[:n_images]
@@ -541,12 +722,15 @@ def main(
         with open(prompt_path, "r", encoding="utf-8") as f:
             prompt = f.readlines()[0].strip()
 
+        supir_path = supir_paths[i]
         inferencer.infer(
-            prompts=[f"{prompt}, {DEFAULT_PROMPT}"],
+#             prompts=[f"{prompt}, {DEFAULT_PROMPT}"],
+            prompts = [DEFAULT_PROMPT],
             controlnet_cond_image=lq_path,
-            init_image=lq_path,
+            init_image=supir_path,
             denoise=denoise,
             out_dir=out_dir,
+            
             save_path=f"recon_{str(i).zfill(5)}.png",
         )
 

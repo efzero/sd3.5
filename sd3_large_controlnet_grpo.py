@@ -12,6 +12,22 @@
 #   - Normalizes rewards to advantages within the K-group per image
 #   - Trains with PPO-clipped policy gradient loss on stored trajectory log probs
 
+
+# python sd3_large_controlnet_grpo.py --model models/sd3.5_large.safetensors --controlnet_ckpt models/sd3.5_large_controlnet_blur.safetensors --model_folder models --image_root /scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/images_train_CelebA/ --lq_image_root /scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_images_train_CelebA/ --captions_file /scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/data/lq_prompts_train_CelebA/--num_seeds 6 --grpo_steps 20 --cfg_scale 4.5 --noise_level 2.5 --clip_range 1e-2 --lr 5e-5 --timestep_fraction 0.3
+
+
+# python sd3_large_controlnet_grpo.py --model models/sd3.5_large.safetensors --controlnet_ckpt models/sd3.5_large_controlnet_blur.safetensors --model_folder models --image_root /scratch/liyues_root/liyues/shared_data/bowenbw/sd3.5/test_VideoLQ --lq_image_root /scratch/liyues_root/liyues/shared_data/bowenbw/sd3.5/recon_dit4sr_VideoLQ --captions_file /scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/test_VideoLQ_prompts/ --num_seeds 6 --grpo_steps 20 --cfg_scale 4.5 --noise_level 2.5 --clip_range 1e-2 --lr 5e-5 --timestep_fraction 0.3
+
+
+# python sd3_large_controlnet_grpo.py --model models/sd3.5_large.safetensors --controlnet_ckptmodels/sd3.5_large_controlnet_blur.safetensors --model_folder models --image_root /scratch/liyues_root/liyues/shared_data/bowenbw/sd3.5/recon_dit4sr_VideoLQ/sample00 --lq_image_root /scratch/liyues_root/liyues/shared_data/bowenbw/sd3.5/test_VideoLQ --captions_file /scratch/liyues_root/liyues/shared_data/bowenbw/sd3-ref/test_VideoLQ_prompts/ --num_seeds 6 --grpo_steps 20 --cfg_scale 4.5 --noise_level 2.5 --clip_range 1e-2 --lr 5e-5 --timestep_fraction 0.3
+
+# # CUDA_VISIBLE_DEVICES=0 python test/test_wollava.py \
+# --pretrained_model_name_or_path="preset/stable-diffusion-3.5-medium" \
+# --transformer_model_name_or_path="preset/dit4sr_q" \
+# --image_path ../sd3-ref/test_VideoLQ_dit4sr/ \
+# --output_dir ../sd3.5/recon_dit4sr_VideoLQ/ \
+# --prompt_path ../sd3-ref/test_VideoLQ_prompts/ \
+# --control_cutoff 1000
 import os
 import math
 import time
@@ -52,7 +68,7 @@ from PIL import Image
 # Create once (global / trainer init), not inside the reward call.
 _lpips_model = None
 
-def init_lpips(device="cuda", net="alex"):
+def init_lpips(device="cuda", net="vgg"):
     global _lpips_model
     _lpips_model = lpips.LPIPS(net=net).to(device).eval()
     
@@ -386,7 +402,7 @@ def reward_model_lpips_l1_batch(
     lp = _lpips_model(gen_m11, gt_m11)
     lp = lp.view(lp.shape[0], -1).mean(1)  # (N,)
 
-    l1 = (gen_01 - gt_01).abs().mean(dim=(1, 2, 3)) * 5    # (N,)
+    l1 = (gen_01 - gt_01).abs().mean(dim=(1, 2, 3)) * 2.5    # (N,)
     print(l1, "l1", lp, "lpips")
 
     reward = -(lpips_weight * lp + l1_weight * l1)
@@ -417,8 +433,8 @@ def reward_model_lpips_musiq_batch(
     gt_images,
     device="cuda",
     group_size: int = 6,            # e.g., K for GRPO
-    lpips_tie_thresh: float = 0.03,
-    musiq_scale: float = 300.0,    
+    lpips_tie_thresh: float = 0.03, ###change 2/26 from 0.03 to 0.02
+    musiq_scale: float = 200.0,    
 ):
     """
     Reward = -LPIPS + gated MUSIQ bonus.
@@ -453,10 +469,11 @@ def reward_model_lpips_musiq_batch(
     # LPIPS
     lpips_d = _lpips_model(gen_lp, gt_lp)               # (N,1,1,1) or (N,1)
     lpips_d = lpips_d.view(lpips_d.shape[0], -1).mean(1)  # (N,)
-    base_reward = -lpips_d
+    base_reward = -lpips_d 
+    l1_d = torch.abs(gen_lp - gt_lp).mean(dim=(1, 2, 3))
+    base_addon = -l1_d
     
     
-
     # MUSIQ (higher is better)
     musiq_score = _musiq_model(gen_mq).view(-1)  # shape (N,) in many pyiqa setups
 
@@ -472,24 +489,70 @@ def reward_model_lpips_musiq_batch(
         assert N % group_size == 0, f"N={N} must be divisible by group_size={group_size}"
         G = N // group_size
         lp = lpips_d.view(G, group_size)
-        mq = musiq_score.view(G, group_size)
-        
-
+        mq = musiq_score.view(G, group_size)     
         lp_best = lp.min(dim=1, keepdim=True).values
-        mq_worst = mq.min(dim=1, keepdim=True).values
-        mq_adv = mq - mq_worst
+#         mq_worst = mq.min(dim=1, keepdim=True).values
+        mq_mean = mq.mean(dim=1, keepdim=True)
+#         mq_adv = mq - mq_worst
+        mq_adv = mq - mq_mean
         gate = ((lp - lp_best) < lpips_tie_thresh).float()
-
         bonus = (gate * (mq_adv / musiq_scale)).view(-1)
-
     rewards = base_reward + bonus
 
-#     aux = {
-#         "lpips": lpips_d.detach().cpu(),
-#         "musiq": musiq_score.detach().cpu(),
-#         "bonus": bonus.detach().cpu(),
-#         "base_reward": base_reward.detach().cpu(),
-#     }
+
+    return rewards.detach().cpu(), musiq_score.detach().cpu(), lpips_d.detach().cpu()
+
+
+def reward_model_musiq_batch(
+    gen_images,
+    gt_images,
+    device="cuda",
+    group_size: int = 6,            # e.g., K for GRPO
+    lpips_tie_thresh: float = 0.03, ###change 2/26 from 0.03 to 0.02
+    musiq_scale: float = 200.0,    
+):
+    """
+    Reward = -LPIPS + gated MUSIQ bonus.
+
+    If group_size is provided, use group-relative tie-break:
+      add MUSIQ bonus only when LPIPS is within lpips_tie_thresh of group-best LPIPS.
+
+    Returns:
+      rewards: (N,) cpu tensor
+      aux: dict of cpu tensors for logging (lpips, musiq, bonus)
+    """
+    global _lpips_model, _musiq_model
+    init_reward_models(device=device)
+
+    def stack_pil(imgs):
+        arr = np.stack(
+            [np.array(im.convert("RGB")).astype(np.float32) / 255.0 for im in imgs],
+            axis=0
+        )  # (N,H,W,3)
+        t = torch.from_numpy(arr).permute(0, 3, 1, 2)  # (N,3,H,W)
+        t = t * 2.0 - 1.0  # for LPIPS
+        return t
+
+    # LPIPS input in [-1,1]
+    gen_lp = stack_pil(gen_images).to(device)
+    gt_lp  = stack_pil(gt_images).to(device)
+
+    # MUSIQ commonly expects [0,1] RGB (check your pyiqa version)
+    gen_mq = (gen_lp + 1.0) / 2.0
+    gen_mq = gen_mq.clamp(0, 1)
+
+    # LPIPS
+    lpips_d = _lpips_model(gen_lp, gt_lp)               # (N,1,1,1) or (N,1)
+    lpips_d = lpips_d.view(lpips_d.shape[0], -1).mean(1)  # (N,)
+    base_reward = -lpips_d 
+    l1_d = torch.abs(gen_lp - gt_lp).mean(dim=(1, 2, 3))
+    base_addon = -l1_d
+    
+    
+    # MUSIQ (higher is better)
+    musiq_score = _musiq_model(gen_mq).view(-1)  # shape (N,) in many pyiqa setups
+    rewards = musiq_score
+
 
     return rewards.detach().cpu(), musiq_score.detach().cpu(), lpips_d.detach().cpu()
 
@@ -500,183 +563,6 @@ def reward_model_lpips_musiq_batch(
 import math
 from typing import Optional, Tuple
 import torch
-
-
-
-import math
-from typing import Optional, Tuple
-import torch
-
-# def euler_sde_step_with_logprob(
-#     pred_x0: torch.Tensor,              # (B, C, H, W) model predicts x0
-#     x_t: torch.Tensor,                  # (B, C, H, W) current latent x_t
-#     sigma_curr: torch.Tensor,           # (B,) current scheduler "sigma" (time-like t in (0,1))
-#     sigma_next: torch.Tensor,           # (B,) next scheduler "sigma" (usually smaller in reverse sampling)
-#     noise_level: float = 0.7,           # scalar a in std_dev_t = a * sqrt(t/(1-t))
-#     x_next_given: Optional[torch.Tensor] = None,  # evaluate log_prob at this point
-#     temperature: float = 1.0,
-# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-#     """
-#     Euler-Maruyama SDE step + Gaussian log-prob, matching the provided scheduler update,
-#     but for a model that predicts x0 instead of velocity.
-
-#     Uses:
-#         v = (x_t - pred_x0) / t
-#         std_dev_t = noise_level * sqrt(t / (1 - t))
-#         dt = t_next - t_curr   (typically negative in reverse denoising)
-
-#         mean = x_t * (1 + std_dev_t^2/(2t) * dt)
-#              + v   * (1 + std_dev_t^2*(1-t)/(2t)) * dt
-
-#         x_next = mean + std_dev_t * sqrt(-dt) * eps
-
-#     Returns:
-#         x_next:   (B, C, H, W)
-#         log_prob: (B,)   # per-element mean formulation (same style as your code)
-#         mean:     (B, C, H, W)
-#         std:      (B, 1, 1, 1)  # actual transition std (includes sqrt(-dt))
-#     """
-#     pred_x0 = pred_x0.float()
-#     x_t = x_t.float()
-#     if x_next_given is not None:
-#         x_next_given = x_next_given.float()
-
-#     B = x_t.shape[0]
-#     ndims = x_t.ndim
-#     device = x_t.device
-#     dtype = x_t.dtype
-
-#     # Broadcast shape (B,1,1,1,...)
-#     t = sigma_curr.view(B, *([1] * (ndims - 1))).to(device=device, dtype=dtype)
-#     t_next = sigma_next.view(B, *([1] * (ndims - 1))).to(device=device, dtype=dtype)
-
-#     # Reverse denoising usually => dt < 0
-#     dt = t_next - t
-
-#     # Numerical safety near 0/1
-#     t_safe = t.clamp(min=1e-6, max=1.0 - 1e-6)
-
-#     # Convert x0 prediction to velocity prediction
-#     # x_t = t * eps + (1 - t) * x0  => v = eps - x0 = (x_t - x0) / t
-#     v = (x_t - pred_x0) / t_safe
-
-#     # sigma_t from the paper (named std_dev_t in your scheduler code)
-#     std_dev_t = noise_level * torch.sqrt(t_safe / (1.0 - t_safe))  # (B,1,1,1,...)
-
-#     # Mean update (same structure as your provided code, but model_output -> v)
-#     mean = (
-#         x_t * (1.0 + (std_dev_t ** 2) / (2.0 * t_safe) * dt)
-#         + v   * (1.0 + (std_dev_t ** 2) * (1.0 - t_safe) / (2.0 * t_safe)) * dt
-#     )
-
-#     # Transition std for reverse step: std_dev_t * sqrt(-dt)
-#     neg_dt = (-dt).clamp(min=1e-12)
-#     trans_std = std_dev_t * torch.sqrt(neg_dt)
-
-#     # Sample / evaluate
-#     if x_next_given is not None:
-#         x_next = x_next_given
-#     elif noise_level > 0:
-#         x_next = mean + trans_std * torch.randn_like(x_t)
-#     else:
-#         x_next = mean.clone()
-
-#     # Gaussian log-prob (mean-reduced version to match your existing style)
-#     trans_std_safe = trans_std.clamp(min=1e-12)
-#     reduce_dims = tuple(range(1, ndims))
-#     sq_err = ((x_next - mean).pow(2) / trans_std_safe.pow(2)).mean(dim=reduce_dims)  # (B,)
-
-#     # each sample has scalar std broadcasted over all non-batch dims
-#     log_std_b = trans_std_safe.view(B, -1)[:, 0].log()  # (B,)
-
-#     log_prob = -0.5 * sq_err - log_std_b - 0.5 * math.log(2.0 * math.pi)
-
-#     if temperature != 1.0:
-#         log_prob = log_prob / temperature
-
-#     return x_next, log_prob, mean, trans_std
-
-# def euler_sde_step_with_logprob(
-#     pred_x0: torch.Tensor,           # (B, C, H, W) model x0 prediction
-#     x_t: torch.Tensor,               # (B, C, H, W) current latent at time t
-#     sigma_curr: torch.Tensor,        # (B,) interpreted as current time t_curr in (0,1)
-#     sigma_next: torch.Tensor,        # (B,) interpreted as next time t_next in (0,1)
-#     noise_level: float = 0.7,        # scalar a in sigma_t = a * sqrt(t/(1-t))
-#     x_next_given: Optional[torch.Tensor] = None,
-#     temperature: float = 5000.0,
-# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-#     """
-#     Euler-Maruyama step based on Eq. (9):
-
-#         x_{t+dt} = x_t + [ v_theta(x_t,t)
-#                            + (sigma_t^2 / (2t)) * (x_t + (1-t) v_theta(x_t,t))
-#                          ] * dt
-#                    + sigma_t * sqrt(dt) * eps
-
-#     where sigma_t = a * sqrt(t / (1 - t)).
-
-#     IMPORTANT:
-#     - Here sigma_curr / sigma_next are treated as *time* t, not SD3 noise sigma.
-#     - If you are doing reverse-time denoising (t_next < t_curr), we use:
-#         dt = t_next - t_curr   (signed, for drift)
-#         std = sigma_t * sqrt(|dt|)  (for Gaussian variance)
-#       This preserves a valid Gaussian transition for logging likelihood.
-
-#     Returns:
-#         x_next:   (B, C, H, W)
-#         log_prob: (B,)
-#         mean:     (B, C, H, W)
-#         std:      (B, 1, 1, 1)
-#     """
-#     B, C, H, W = x_t.shape
-#     device = x_t.device
-#     dtype = x_t.dtype
-
-#     t_curr = sigma_curr.reshape(B, 1, 1, 1).to(device=device, dtype=dtype)
-#     t_next = sigma_next.reshape(B, 1, 1, 1).to(device=device, dtype=dtype)
-
-#     # signed step (can be negative in reverse-time sampling)
-#     dt = t_next - t_curr
-
-#     # Numerical safety for divisions / sqrt near boundaries
-#     t_safe = t_curr.clamp(min=1e-6, max=1.0 - 1e-6)
-
-#     # v_theta(x_t, t) from x0-prediction under x_t = t * eps + (1 - t) * x0
-#     # => v = eps - x0 = (x_t - x0) / t
-#     v = (x_t - pred_x0) / t_safe
-
-#     # sigma_t = a * sqrt(t / (1 - t))
-#     sigma_t = noise_level * torch.sqrt(t_safe / (1.0 - t_safe))  # (B,1,1,1)
-
-#     # Drift term in Eq. (9)
-#     drift = v + (sigma_t.pow(2) / (2.0 * t_safe)) * (x_t + (1.0 - t_safe) * v)
-
-#     # EM mean update (use signed dt)
-#     mean = x_t + drift * dt
-
-#     # Gaussian noise std for transition (use |dt| so variance is nonnegative)
-#     std = sigma_t * torch.sqrt(dt.abs().clamp(min=1e-12))  # (B,1,1,1)
-
-#     # Sample or evaluate log-prob at provided point
-#     if x_next_given is not None:
-#         x_next = x_next_given
-#     elif noise_level > 0:
-#         x_next = mean + std * torch.randn_like(x_t)
-#     else:
-#         x_next = mean.clone()
-
-#     # Gaussian log-prob (your "mean formulation")
-#     # log p = -0.5 * mean(((x-mean)/std)^2) - log(std) - 0.5log(2pi)
-#     # (per-element average, not summed over dimensions)
-#     std_safe = std.clamp(min=1e-12)
-#     sq_err = ((x_next - mean).pow(2) / std_safe.pow(2)).mean(dim=(1, 2, 3))  # (B,)
-#     log_std_b = std_safe.reshape(B).log()  # (B,)
-#     log_prob = -0.5 * sq_err - log_std_b - 0.5 * math.log(2.0 * math.pi)
-
-#     # Optional temperature ......scaling (uncomment if desired)
-#     # log_prob = log_prob / temperature
-
-#     return x_next, log_prob, mean, std
 
 
 #####given by GPT previously###############
@@ -781,7 +667,7 @@ class TrainConfig:
     grad_clip: float = 1.0
 
     log_every: int = 1
-    save_every: int = 100
+    save_every: int = 50
 
     # LoRA
     lora_r: int = 128
@@ -811,8 +697,8 @@ class GRPOConfig(TrainConfig):
     timestep_fraction: float = 0.50 # Fraction of timesteps to train on  (timestep_fraction=0.99)
     kl_beta: float = 0.00           # KL regularization weight  (beta=0.02)
     wandb_project: str = "sd3-grpo-controlnet"
-    wandb_run_name: str = "grpo-run-lpipsmusiq-seed6-ccs-2.5-cutoff750-step300.25"
-    save_suffix: str = f"grpo-run-lpipsmusiq-seed6-ccs-2.5-cutoff750-step300.25"
+    wandb_run_name: str = "grpo-run-lpipsmusiq-seed6-ccs-2.5-cutoff750-step20-0.3-lcut0.03-videolq"
+    save_suffix: str = f"grpo-run-lpipsmusiq-seed6-ccs-2.5-cutoff750-step20-0.3-lcut0.03-videolq"
 
 
 ################################################################################
@@ -1174,12 +1060,17 @@ class GRPOTrainer:
                 imgperprompt=cfg.imgperprompt,
             )
             
-        seed_ = 45
-        g2 = torch.Generator()
-        g2.manual_seed(seed_)
+        ################################change this##################################
+#         seed_ = 45 ####only for celeba, div2k
+#         g2 = torch.Generator()
+#         g2.manual_seed(seed_)
+        
+#         loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True,
+#                             num_workers=cfg.num_workers, drop_last=True, generator=g2,)
+        #################################################################################
         
         loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True,
-                            num_workers=cfg.num_workers, drop_last=True, generator=g2,)
+                            num_workers=cfg.num_workers, drop_last=True)
 
         # Precompute negative prompt embeddings once
         neg_c_raw, neg_y_raw = self.encode_prompt("")   # (1, seq, d), (1, d) on CPU
@@ -1219,6 +1110,7 @@ class GRPOTrainer:
                 for cap in captions_list:
                     u = random.uniform(0, 1)
                     p = DEFAULT_PROMPT if u < 0.4 else f"{cap}, {DEFAULT_PROMPT}"
+#                     p = DEFAULT_PROMPT ###Changes to use default prompt instead of better prompts
                     c, y = self.encode_prompt(p)
                     c_list.append(c)
                     y_list.append(y)
@@ -1482,6 +1374,7 @@ class GRPOTrainer:
                 )
 
             wandb.log(log_dict, step=self.global_step)
+            
 
             if self.global_step % cfg.log_every == 0:
                 dt = time.time() - start
