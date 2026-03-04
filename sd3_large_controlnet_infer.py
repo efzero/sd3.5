@@ -258,7 +258,7 @@ class InferConfig:
     steps: int = 60
     cfg_scale: float = 4.5
     sampler: str = "euler"
-    seed: int = 23
+    seed: int = 20000
     denoise: float = 1.0
     width: int = 1024
     height: int = 1024
@@ -724,8 +724,8 @@ def main(
 
         supir_path = supir_paths[i]
         inferencer.infer(
-#             prompts=[f"{prompt}, {DEFAULT_PROMPT}"],
-            prompts = [DEFAULT_PROMPT],
+            prompts=[f"{prompt}, {DEFAULT_PROMPT}"],
+#             prompts = [DEFAULT_PROMPT],
             controlnet_cond_image=lq_path,
             init_image=supir_path,
             denoise=denoise,

@@ -697,8 +697,8 @@ class GRPOConfig(TrainConfig):
     timestep_fraction: float = 0.50 # Fraction of timesteps to train on  (timestep_fraction=0.99)
     kl_beta: float = 0.00           # KL regularization weight  (beta=0.02)
     wandb_project: str = "sd3-grpo-controlnet"
-    wandb_run_name: str = "grpo-run-lpipsmusiq-seed6-ccs-2.5-cutoff750-step20-0.3-lcut0.03-videolq"
-    save_suffix: str = f"grpo-run-lpipsmusiq-seed6-ccs-2.5-cutoff750-step20-0.3-lcut0.03-videolq"
+    wandb_run_name: str = "grpo-run-lpipsmusiq-seed6-ccs-2.5-cutoff750-step20-0.3-lcut0.03-videolq-corrected-pretrainedmusiq"
+    save_suffix: str = f"grpo-run-lpipsmusiq-seed6-ccs-2.5-cutoff750-step20-0.3-lcut0.03-videolq-corrected-pretrainedmusiq"
 
 
 ################################################################################
@@ -1189,12 +1189,26 @@ class GRPOTrainer:
                     flat_gt.append(gt_images[b])           # same GT repeated K times
 
             # Compute reward once, with correct group_size=K
-            flat_rewards, flat_musiqs, flat_lpips = reward_model_lpips_musiq_batch(
+            ####CHANGE THIS#######for gated lpips musiq################
+#             flat_rewards, flat_musiqs, flat_lpips = reward_model_lpips_musiq_batch(
+#                 flat_gen,
+#                 flat_gt,
+#                 device=self.device,
+#                 group_size=K,   # IMPORTANT: group over K candidates of the same image
+#             )
+#             ###################################################
+            
+            ###########CHANGE THIS##############for musiq only##########################
+            flat_rewards, flat_musiqs, flat_lpips = reward_model_musiq_batch(
                 flat_gen,
                 flat_gt,
                 device=self.device,
                 group_size=K,   # IMPORTANT: group over K candidates of the same image
             )
+            ############################################################################################
+            
+            
+            
 
             # Reshape back: flat was (B, K), so view(B, K) then transpose -> (K, B)
             rewards = flat_rewards.view(B, K).transpose(0, 1).contiguous()         # (K, B)
@@ -1415,7 +1429,8 @@ class GRPOTrainer:
 def main(**kwargs):
     cfg = GRPOConfig(**kwargs)
     trainer = GRPOTrainer(cfg)
-    trainer._load("outputs/controlnet_lora/controlnet_lora_step2000_20260127_074346_large.pt")
+#     trainer._load("outputs/controlnet_lora/controlnet_lora_step2000_20260127_074346_large.pt")
+    trainer._load("outputs/controlnet_grpo/controlnet_grpo-run-lpipsmusiq-seed6-ccs-2.5-cutoff750_step2500_20260226_015338.pt")
     trainer.snapshot_ref_lora()
     trainer.train_grpo()
 
